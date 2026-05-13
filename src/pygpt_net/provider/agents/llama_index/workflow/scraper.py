@@ -12,26 +12,38 @@
 """
 Scraper Agent Workflow
 ----------------------
-Browser-capable scraping agent with Playwright. Supports:
-  - General web page scraping
+Browser-capable scraping agent with dual-backend support:
+
+  Backend A — agent-browser (preferred, if installed)
+    CLI tool by Vercel Labs (https://github.com/vercel-labs/agent-browser).
+    Uses Chrome DevTools Protocol with deterministic element refs (@e1, @e2),
+    JSON snapshot output, semantic locators, and annotated screenshots.
+    Designed specifically for LLM/AI-agent consumption.
+    Install: npm install -g agent-browser && agent-browser install
+
+  Backend B — Playwright (fallback)
+    Direct Playwright sync_api automation.  No extra install needed
+    (already a project dependency).
+
+The ScraperWorkflow auto-detects which backend is available and builds the
+appropriate FunctionTools.  Both expose the same logical tool names so the
+FunctionAgent behaves identically regardless of backend.
+
+Supported capabilities:
+  - General web page scraping / element extraction
   - Google Maps place/business data extraction
   - Public Facebook page content extraction
-  - Screenshot capture
-
-The agent uses FunctionAgent with a set of Playwright-backed tools and runs
-as a standard LlamaIndex Workflow compatible with the existing Runner.
+  - Screenshot capture (annotated for agent-browser)
 """
 
-import asyncio
 import json
-import re
+import shutil
+import subprocess
 from typing import Any, Dict, List, Optional
 
-from llama_index.core.agent.workflow import FunctionAgent, AgentStream, AgentOutput
+from llama_index.core.agent.workflow import FunctionAgent
 from llama_index.core.tools import FunctionTool
 from llama_index.core.workflow import (
-    Context,
-    Event,
     StartEvent,
     StopEvent,
     Workflow,
@@ -44,39 +56,261 @@ from llama_index.core.workflow import (
 # ---------------------------------------------------------------------------
 
 SCRAPER_SYSTEM_PROMPT = """
-You are a Browser Scraper Agent. You have access to tools that control a real
-Chromium browser via Playwright. Use them to:
+You are a Browser Scraper Agent. You control a real Chromium browser to:
 
 1. Navigate to URLs and extract structured information
 2. Query Google Maps for place data (address, rating, reviews, phone, hours)
 3. Extract content from public Facebook pages
 4. Take screenshots for visual inspection
-5. Fill forms and click buttons when needed
+5. Interact with pages: click buttons, fill forms, follow links
+
+When using agent-browser backend you receive structured element snapshots with
+stable refs like @e1, @e2.  Use these refs for precise interaction instead of
+guessing CSS selectors.
 
 Always:
 - Return clean, structured JSON when extracting data
 - Respect robots.txt and avoid rate-limiting targets
-- Never enter credentials or personal data into forms
+- Never enter real credentials or personal data into forms
 - Summarise findings clearly in the user's language
 """
 
 
 # ---------------------------------------------------------------------------
-# Playwright tool implementations
+# Backend A: agent-browser CLI tools
 # ---------------------------------------------------------------------------
 
-def _get_or_create_browser_context():
+class AgentBrowserTools:
     """
-    Return a (browser, context, page) triple. Uses a module-level singleton
-    so multiple tool calls within the same run share the same browser session.
+    Wraps the agent-browser CLI (https://github.com/vercel-labs/agent-browser).
+    Uses subprocess to invoke each command; the daemon handles persistence.
     """
-    # Lazy import — Playwright is an optional heavy dependency
-    from playwright.sync_api import sync_playwright
-    return sync_playwright
+
+    def __init__(self, timeout: int = 30):
+        self._timeout = timeout
+        self._bin = "agent-browser"
+
+    def _run(self, *args: str) -> str:
+        """Run an agent-browser command and return stdout."""
+        cmd = [self._bin] + list(args)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout,
+            )
+            if result.returncode != 0 and result.stderr:
+                return f"Error: {result.stderr.strip()[:500]}"
+            return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return f"Timeout after {self._timeout}s running: {' '.join(cmd)}"
+        except FileNotFoundError:
+            return "agent-browser not found. Install with: npm install -g agent-browser && agent-browser install"
+        except Exception as e:
+            return f"Subprocess error: {e}"
+
+    def _batch(self, *commands: str) -> str:
+        """Run multiple commands in a single agent-browser batch call (faster)."""
+        return self._run("batch", *commands)
+
+    # ------------------------------------------------------------------
+    # General web scraping
+    # ------------------------------------------------------------------
+
+    def web_scrape(self, url: str, selector: str = "") -> str:
+        """
+        Navigate to a URL and return a structured JSON snapshot of interactive
+        elements, or extract the text of a specific element by CSS selector.
+
+        :param url: Full URL to visit
+        :param selector: Optional CSS selector — if empty returns full interactive snapshot
+        :return: JSON element snapshot or extracted text (max 8000 chars)
+        """
+        if selector:
+            output = self._batch(
+                f"open {url}",
+                f"get text {selector}",
+            )
+        else:
+            output = self._batch(
+                f"open {url}",
+                "snapshot --interactive --json",
+            )
+        return output[:8000]
+
+    def get_links(self, url: str, filter_text: str = "") -> str:
+        """
+        Get all hyperlinks from a page, optionally filtered by link text.
+
+        :param url: URL to visit
+        :param filter_text: Only return links whose text contains this (case-insensitive)
+        :return: JSON list of {text, href}
+        """
+        output = self._batch(
+            f"open {url}",
+            "find role link snapshot --json",
+        )
+        if filter_text and output:
+            try:
+                data = json.loads(output)
+                ft = filter_text.lower()
+                data = [el for el in data if ft in str(el.get("text", "")).lower()]
+                return json.dumps(data[:100], ensure_ascii=False)
+            except Exception:
+                pass
+        return output[:6000]
+
+    def screenshot(self, url: str, save_path: str = "/tmp/screenshot.png") -> str:
+        """
+        Navigate to URL and save an annotated screenshot (element refs overlaid).
+
+        :param url: URL to screenshot
+        :param save_path: File path to save PNG
+        :return: Confirmation message with path
+        """
+        output = self._batch(
+            f"open {url}",
+            f"screenshot --annotate --output {save_path}",
+        )
+        return f"Screenshot saved to {save_path}\n{output}"
+
+    def click_and_extract(self, url: str, element_ref: str, extract_selector: str = "") -> str:
+        """
+        Navigate to URL, click an element by agent-browser ref (@e1) or semantic
+        locator, then extract resulting page content.
+
+        :param url: URL to visit
+        :param element_ref: Element ref like @e3, or semantic like 'role button --name Submit'
+        :param extract_selector: Optional CSS selector to extract after click
+        :return: Page snapshot or extracted text after click
+        """
+        click_cmd = f"click {element_ref}"
+        if extract_selector:
+            extract_cmd = f"get text {extract_selector}"
+        else:
+            extract_cmd = "snapshot --interactive --json"
+        output = self._batch(
+            f"open {url}",
+            click_cmd,
+            extract_cmd,
+        )
+        return output[:8000]
+
+    def fill_form(self, url: str, element_ref: str, value: str) -> str:
+        """
+        Navigate to URL and fill a form field with a value.
+
+        :param url: URL to visit
+        :param element_ref: Element ref like @e2, or semantic like 'label "Email"'
+        :param value: Value to type into the field
+        :return: Snapshot after fill
+        """
+        output = self._batch(
+            f"open {url}",
+            f"fill {element_ref} {json.dumps(value)}",
+            "snapshot --interactive --json",
+        )
+        return output[:8000]
+
+    # ------------------------------------------------------------------
+    # Google Maps
+    # ------------------------------------------------------------------
+
+    def google_maps_search(self, query: str, max_results: int = 5) -> str:
+        """
+        Search Google Maps for places/businesses matching the query.
+
+        :param query: Search query (e.g. "pizza restaurants Warsaw")
+        :param max_results: Maximum number of results to return
+        :return: JSON snapshot of search results
+        """
+        encoded = query.replace(" ", "+")
+        url = f"https://www.google.com/maps/search/{encoded}"
+        output = self._batch(
+            f"open {url}",
+            "wait 3000",
+            "snapshot --json",
+        )
+        return output[:8000]
+
+    def google_maps_place_details(self, place_name: str, address: str = "") -> str:
+        """
+        Get detailed information about a specific place on Google Maps.
+
+        :param place_name: Name of the place
+        :param address: Optional address to narrow the search
+        :return: Extracted place details text
+        """
+        query = f"{place_name} {address}".strip().replace(" ", "+")
+        url = f"https://www.google.com/maps/search/{query}"
+        output = self._batch(
+            f"open {url}",
+            "wait 3000",
+            "find role listitem click",   # click first result
+            "wait 3000",
+            "get text h1",
+            "snapshot --json",
+        )
+        return output[:8000]
+
+    # ------------------------------------------------------------------
+    # Facebook (public pages only)
+    # ------------------------------------------------------------------
+
+    def facebook_public_page(self, page_url: str) -> str:
+        """
+        Extract publicly visible content from a Facebook page (mbasic).
+
+        :param page_url: Full URL of the Facebook page
+        :return: Extracted text content (max 8000 chars)
+        """
+        url = page_url.replace("www.facebook.com", "mbasic.facebook.com")
+        output = self._batch(
+            f"open {url}",
+            "wait 2000",
+            "snapshot --json",
+        )
+        return output[:8000]
+
+    def facebook_search(self, query: str) -> str:
+        """
+        Search public Facebook content via mbasic interface.
+
+        :param query: Search query
+        :return: Search results snapshot
+        """
+        encoded = query.replace(" ", "+")
+        url = f"https://mbasic.facebook.com/search/posts?q={encoded}"
+        output = self._batch(
+            f"open {url}",
+            "wait 2000",
+            "snapshot --json",
+        )
+        return output[:6000]
+
+    def natural_language_action(self, url: str, instruction: str) -> str:
+        """
+        Navigate to URL and execute a natural language browser instruction via
+        agent-browser's built-in AI chat mode.
+
+        :param url: URL to visit first
+        :param instruction: Natural language instruction (e.g. 'Click the login button')
+        :return: Result snapshot or text
+        """
+        output = self._batch(
+            f"open {url}",
+            f"chat {json.dumps(instruction)}",
+        )
+        return output[:8000]
 
 
-class BrowserTools:
-    """Namespace for all Playwright-backed scraping tools."""
+# ---------------------------------------------------------------------------
+# Backend B: Playwright tools (fallback)
+# ---------------------------------------------------------------------------
+
+class PlaywrightTools:
+    """Playwright sync_api browser automation — fallback when agent-browser absent."""
 
     def __init__(self, headless: bool = True, timeout_ms: int = 30_000):
         self._headless = headless
@@ -85,23 +319,14 @@ class BrowserTools:
         self._browser = None
         self._page = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     def start(self):
-        """Launch browser (called before any tool use in this run)."""
-        try:
-            from playwright.sync_api import sync_playwright
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=self._headless)
-            self._page = self._browser.new_page()
-            self._page.set_default_timeout(self._timeout)
-        except Exception as e:
-            raise RuntimeError(f"Failed to start Playwright browser: {e}") from e
+        from playwright.sync_api import sync_playwright
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(headless=self._headless)
+        self._page = self._browser.new_page()
+        self._page.set_default_timeout(self._timeout)
 
     def stop(self):
-        """Close browser session."""
         try:
             if self._browser:
                 self._browser.close()
@@ -109,10 +334,9 @@ class BrowserTools:
                 self._playwright.stop()
         except Exception:
             pass
-        finally:
-            self._browser = None
-            self._playwright = None
-            self._page = None
+        self._browser = None
+        self._playwright = None
+        self._page = None
 
     @property
     def page(self):
@@ -120,37 +344,16 @@ class BrowserTools:
             self.start()
         return self._page
 
-    # ------------------------------------------------------------------
-    # General web scraping
-    # ------------------------------------------------------------------
-
-    def navigate_and_extract(self, url: str, selector: str = "body") -> str:
-        """
-        Navigate to a URL and extract text content from the given CSS selector.
-
-        :param url: Full URL to visit
-        :param selector: CSS selector to extract (default: entire body)
-        :return: Extracted text content (max 8000 chars)
-        """
+    def web_scrape(self, url: str, selector: str = "body") -> str:
         try:
             self.page.goto(url, wait_until="domcontentloaded")
             self.page.wait_for_timeout(1500)
-            element = self.page.query_selector(selector)
-            if element is None:
-                return f"Selector '{selector}' not found on {url}"
-            text = element.inner_text()
-            return text[:8000]
+            el = self.page.query_selector(selector)
+            return (el.inner_text() if el else f"Selector '{selector}' not found")[:8000]
         except Exception as e:
             return f"Error scraping {url}: {e}"
 
-    def get_page_links(self, url: str, filter_text: str = "") -> str:
-        """
-        Get all hyperlinks from a page, optionally filtered by link text.
-
-        :param url: URL to visit
-        :param filter_text: Only return links whose text contains this string
-        :return: JSON list of {text, href} objects
-        """
+    def get_links(self, url: str, filter_text: str = "") -> str:
         try:
             self.page.goto(url, wait_until="domcontentloaded")
             self.page.wait_for_timeout(1000)
@@ -165,119 +368,78 @@ class BrowserTools:
         except Exception as e:
             return f"Error getting links from {url}: {e}"
 
-    def take_screenshot(self, url: str, save_path: str = "/tmp/screenshot.png") -> str:
-        """
-        Navigate to URL and save a screenshot.
-
-        :param url: URL to screenshot
-        :param save_path: File path to save PNG
-        :return: Confirmation message with path
-        """
+    def screenshot(self, url: str, save_path: str = "/tmp/screenshot.png") -> str:
         try:
             self.page.goto(url, wait_until="domcontentloaded")
             self.page.wait_for_timeout(2000)
             self.page.screenshot(path=save_path, full_page=True)
             return f"Screenshot saved to {save_path}"
         except Exception as e:
-            return f"Error taking screenshot of {url}: {e}"
+            return f"Error taking screenshot: {e}"
 
-    def click_and_extract(self, url: str, click_selector: str, extract_selector: str = "body") -> str:
-        """
-        Navigate to URL, click an element, then extract text.
-
-        :param url: URL to visit
-        :param click_selector: CSS selector of element to click
-        :param extract_selector: CSS selector to extract after click
-        :return: Extracted text (max 8000 chars)
-        """
+    def click_and_extract(self, url: str, element_ref: str, extract_selector: str = "body") -> str:
         try:
             self.page.goto(url, wait_until="domcontentloaded")
             self.page.wait_for_timeout(1000)
-            self.page.click(click_selector)
+            self.page.click(element_ref)
             self.page.wait_for_timeout(2000)
-            element = self.page.query_selector(extract_selector)
-            if element is None:
-                return f"Selector '{extract_selector}' not found after click"
-            return element.inner_text()[:8000]
+            el = self.page.query_selector(extract_selector)
+            return (el.inner_text() if el else "Not found")[:8000]
         except Exception as e:
             return f"Error in click_and_extract: {e}"
 
-    # ------------------------------------------------------------------
-    # Google Maps
-    # ------------------------------------------------------------------
+    def fill_form(self, url: str, element_ref: str, value: str) -> str:
+        try:
+            self.page.goto(url, wait_until="domcontentloaded")
+            self.page.wait_for_timeout(1000)
+            self.page.fill(element_ref, value)
+            self.page.wait_for_timeout(1000)
+            return self.web_scrape(url, "body")
+        except Exception as e:
+            return f"Error in fill_form: {e}"
 
     def google_maps_search(self, query: str, max_results: int = 5) -> str:
-        """
-        Search Google Maps for places/businesses matching the query.
-
-        :param query: Search query (e.g. "pizza restaurants Warsaw")
-        :param max_results: Maximum number of results to return
-        :return: JSON list of place objects with name, address, rating, etc.
-        """
         try:
             encoded = query.replace(" ", "+")
-            url = f"https://www.google.com/maps/search/{encoded}"
-            self.page.goto(url, wait_until="domcontentloaded")
+            self.page.goto(f"https://www.google.com/maps/search/{encoded}", wait_until="domcontentloaded")
             self.page.wait_for_timeout(3000)
-
-            # Accept cookies if dialog appears
             try:
                 self.page.click("button:has-text('Accept all')", timeout=3000)
                 self.page.wait_for_timeout(1000)
             except Exception:
                 pass
-
-            # Extract result cards
             results = []
             cards = self.page.query_selector_all("[data-result-index]")[:max_results]
             for card in cards:
                 try:
                     name = card.query_selector("[class*='fontHeadlineSmall']")
                     rating = card.query_selector("[class*='MW4etd']")
-                    reviews = card.query_selector("[class*='UY7F9']")
                     address = card.query_selector("[class*='W4Efsd']")
                     results.append({
                         "name": name.inner_text() if name else "",
                         "rating": rating.inner_text() if rating else "",
-                        "reviews": reviews.inner_text() if reviews else "",
                         "address": address.inner_text() if address else "",
                     })
                 except Exception:
                     pass
-
-            # Fallback: extract raw text from results panel
             if not results:
                 panel = self.page.query_selector("[role='feed']")
                 if panel:
-                    raw = panel.inner_text()[:4000]
-                    return f"Raw results:\n{raw}"
-
+                    return panel.inner_text()[:4000]
             return json.dumps(results, ensure_ascii=False)
         except Exception as e:
-            return f"Error searching Google Maps for '{query}': {e}"
+            return f"Error searching Google Maps: {e}"
 
     def google_maps_place_details(self, place_name: str, address: str = "") -> str:
-        """
-        Get detailed information about a specific place on Google Maps.
-
-        :param place_name: Name of the place
-        :param address: Optional address to narrow the search
-        :return: JSON with place details: address, phone, hours, website, rating
-        """
         try:
             query = f"{place_name} {address}".strip().replace(" ", "+")
-            url = f"https://www.google.com/maps/search/{query}"
-            self.page.goto(url, wait_until="domcontentloaded")
+            self.page.goto(f"https://www.google.com/maps/search/{query}", wait_until="domcontentloaded")
             self.page.wait_for_timeout(3000)
-
-            # Accept cookies
             try:
                 self.page.click("button:has-text('Accept all')", timeout=2000)
                 self.page.wait_for_timeout(800)
             except Exception:
                 pass
-
-            # Click first result
             try:
                 first = self.page.query_selector("[data-result-index='0']")
                 if first:
@@ -285,148 +447,160 @@ class BrowserTools:
                     self.page.wait_for_timeout(3000)
             except Exception:
                 pass
-
-            details = {}
-
             def _text(sel):
                 el = self.page.query_selector(sel)
                 return el.inner_text().strip() if el else ""
-
-            # Try common Maps detail selectors
-            details["name"] = _text("h1")
-            details["rating"] = _text("[class*='fontDisplayLarge']")
-            details["address"] = _text("[data-item-id='address'] .fontBodyMedium")
-            details["phone"] = _text("[data-item-id*='phone'] .fontBodyMedium")
-            details["website"] = _text("[data-item-id='authority'] .fontBodyMedium")
-            details["hours"] = _text("[data-item-id*='oh'] .fontBodyMedium")
-
-            # Remove empty keys
-            details = {k: v for k, v in details.items() if v}
-            return json.dumps(details, ensure_ascii=False)
+            details = {
+                "name": _text("h1"),
+                "address": _text("[data-item-id='address'] .fontBodyMedium"),
+                "phone": _text("[data-item-id*='phone'] .fontBodyMedium"),
+                "website": _text("[data-item-id='authority'] .fontBodyMedium"),
+                "hours": _text("[data-item-id*='oh'] .fontBodyMedium"),
+            }
+            return json.dumps({k: v for k, v in details.items() if v}, ensure_ascii=False)
         except Exception as e:
-            return f"Error fetching place details for '{place_name}': {e}"
-
-    # ------------------------------------------------------------------
-    # Facebook (public pages only)
-    # ------------------------------------------------------------------
+            return f"Error fetching place details: {e}"
 
     def facebook_public_page(self, page_url: str) -> str:
-        """
-        Extract publicly visible content from a Facebook page.
-        Only accesses public/non-login-required content.
-
-        :param page_url: Full URL of the Facebook page
-        :return: Extracted text content (max 8000 chars)
-        """
         try:
-            # Use mbasic for better text extraction without JS
             url = page_url.replace("www.facebook.com", "mbasic.facebook.com")
             self.page.goto(url, wait_until="domcontentloaded")
             self.page.wait_for_timeout(2000)
-
-            # Extract main content
-            content_parts = []
-
-            # Page name / title
-            header = self.page.query_selector("h1")
-            if header:
-                content_parts.append(f"Page: {header.inner_text()}")
-
-            # Posts
+            parts = []
+            h = self.page.query_selector("h1")
+            if h:
+                parts.append(f"Page: {h.inner_text()}")
             posts = self.page.query_selector_all("div[data-ft]")[:10]
-            for post in posts:
-                text = post.inner_text().strip()
-                if text and len(text) > 20:
-                    content_parts.append(text[:500])
-
-            # Fallback: get all text
-            if not content_parts:
+            for p in posts:
+                t = p.inner_text().strip()
+                if t and len(t) > 20:
+                    parts.append(t[:500])
+            if not parts:
                 body = self.page.query_selector("body")
                 if body:
-                    content_parts.append(body.inner_text()[:6000])
-
-            result = "\n\n---\n\n".join(content_parts)
-            return result[:8000] if result else "No public content found"
+                    parts.append(body.inner_text()[:6000])
+            return "\n\n---\n\n".join(parts)[:8000]
         except Exception as e:
-            return f"Error fetching Facebook page '{page_url}': {e}"
+            return f"Error fetching Facebook page: {e}"
 
     def facebook_search(self, query: str) -> str:
-        """
-        Search for public Facebook content using mbasic interface.
-
-        :param query: Search query
-        :return: Search results text (max 6000 chars)
-        """
         try:
             encoded = query.replace(" ", "+")
-            url = f"https://mbasic.facebook.com/search/posts?q={encoded}"
-            self.page.goto(url, wait_until="domcontentloaded")
+            self.page.goto(f"https://mbasic.facebook.com/search/posts?q={encoded}", wait_until="domcontentloaded")
             self.page.wait_for_timeout(2000)
             body = self.page.query_selector("body")
-            if body:
-                return body.inner_text()[:6000]
-            return "No results found"
+            return body.inner_text()[:6000] if body else "No results"
         except Exception as e:
-            return f"Error searching Facebook for '{query}': {e}"
+            return f"Error searching Facebook: {e}"
+
+    def natural_language_action(self, url: str, instruction: str) -> str:
+        return (
+            f"natural_language_action requires agent-browser backend "
+            f"(install: npm install -g agent-browser && agent-browser install). "
+            f"Falling back — please use web_scrape or click_and_extract with explicit selectors."
+        )
 
 
 # ---------------------------------------------------------------------------
-# Build LlamaIndex FunctionTools from BrowserTools
+# Backend auto-detection
 # ---------------------------------------------------------------------------
 
-def build_scraper_tools(browser_tools: BrowserTools) -> List[FunctionTool]:
-    """Create LlamaIndex FunctionTools wrapping BrowserTools methods."""
-    tools = []
+def _agent_browser_available() -> bool:
+    """Return True if the agent-browser CLI is on PATH."""
+    return shutil.which("agent-browser") is not None
 
-    def _wrap(fn, name, desc):
-        import inspect
-        sig = inspect.signature(fn)
-        params = {
-            k: v for k, v in sig.parameters.items()
-            if k != "self"
-        }
-        return FunctionTool.from_defaults(fn=fn, name=name, description=desc)
 
-    tools.append(_wrap(
-        browser_tools.navigate_and_extract,
-        "web_scrape",
-        "Navigate to a URL and extract text content. Args: url (str), selector (str, optional CSS selector, default 'body'). Returns extracted text.",
-    ))
-    tools.append(_wrap(
-        browser_tools.get_page_links,
-        "get_links",
-        "Get all hyperlinks from a web page. Args: url (str), filter_text (str, optional). Returns JSON list of {text, href}.",
-    ))
-    tools.append(_wrap(
-        browser_tools.take_screenshot,
-        "screenshot",
-        "Take a screenshot of a web page. Args: url (str), save_path (str, optional). Returns confirmation.",
-    ))
-    tools.append(_wrap(
-        browser_tools.click_and_extract,
-        "click_and_extract",
-        "Click an element on a page then extract content. Args: url (str), click_selector (str), extract_selector (str, optional).",
-    ))
-    tools.append(_wrap(
-        browser_tools.google_maps_search,
-        "maps_search",
-        "Search Google Maps for places. Args: query (str), max_results (int, optional). Returns JSON list of places.",
-    ))
-    tools.append(_wrap(
-        browser_tools.google_maps_place_details,
-        "maps_place_details",
-        "Get detailed info for a specific place on Google Maps. Args: place_name (str), address (str, optional).",
-    ))
-    tools.append(_wrap(
-        browser_tools.facebook_public_page,
-        "facebook_page",
-        "Extract public content from a Facebook page. Args: page_url (str, full Facebook URL). Returns page content.",
-    ))
-    tools.append(_wrap(
-        browser_tools.facebook_search,
-        "facebook_search",
-        "Search public Facebook content. Args: query (str). Returns search results text.",
-    ))
+def _build_tools(backend) -> List[FunctionTool]:
+    """Build LlamaIndex FunctionTools from a backend instance."""
+    tools = [
+        FunctionTool.from_defaults(
+            fn=backend.web_scrape,
+            name="web_scrape",
+            description=(
+                "Navigate to a URL and extract content. "
+                "Args: url (str), selector (str, optional — CSS selector or empty for full snapshot). "
+                "Returns extracted text or JSON element snapshot."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.get_links,
+            name="get_links",
+            description=(
+                "Get all hyperlinks from a web page. "
+                "Args: url (str), filter_text (str, optional). "
+                "Returns JSON list of {text, href}."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.screenshot,
+            name="screenshot",
+            description=(
+                "Take a screenshot of a web page (annotated with element refs if agent-browser). "
+                "Args: url (str), save_path (str, optional). Returns path confirmation."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.click_and_extract,
+            name="click_and_extract",
+            description=(
+                "Navigate to URL, click an element, then extract content. "
+                "Args: url (str), element_ref (str — CSS selector or @e1 ref or semantic), "
+                "extract_selector (str, optional). Returns content after click."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.fill_form,
+            name="fill_form",
+            description=(
+                "Navigate to URL and fill a form field. "
+                "Args: url (str), element_ref (str — CSS selector, @e2 ref, or label), "
+                "value (str). Returns page snapshot after fill."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.google_maps_search,
+            name="maps_search",
+            description=(
+                "Search Google Maps for places/businesses. "
+                "Args: query (str), max_results (int, optional). "
+                "Returns JSON list of places with name, rating, address."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.google_maps_place_details,
+            name="maps_place_details",
+            description=(
+                "Get detailed info for a specific place on Google Maps. "
+                "Args: place_name (str), address (str, optional). "
+                "Returns JSON with address, phone, website, hours."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.facebook_public_page,
+            name="facebook_page",
+            description=(
+                "Extract public content from a Facebook page (mbasic). "
+                "Args: page_url (str, full Facebook URL). Returns page content."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.facebook_search,
+            name="facebook_search",
+            description=(
+                "Search public Facebook content. "
+                "Args: query (str). Returns search results text."
+            ),
+        ),
+        FunctionTool.from_defaults(
+            fn=backend.natural_language_action,
+            name="browser_chat",
+            description=(
+                "Execute a natural language browser instruction (agent-browser only). "
+                "Args: url (str), instruction (str — e.g. 'Click the login button'). "
+                "Returns result snapshot."
+            ),
+        ),
+    ]
     return tools
 
 
@@ -439,10 +613,6 @@ class ScraperInputEvent(StartEvent):
     headless: bool = True
 
 
-class ScraperStepEvent(Event):
-    message: str
-
-
 # ---------------------------------------------------------------------------
 # Scraper Workflow
 # ---------------------------------------------------------------------------
@@ -450,7 +620,8 @@ class ScraperStepEvent(Event):
 class ScraperWorkflow(Workflow):
     """
     LlamaIndex Workflow wrapping a browser-enabled FunctionAgent.
-    Manages browser lifecycle: opens on start, closes on stop.
+    Selects agent-browser CLI backend (preferred) or Playwright (fallback).
+    Manages browser/daemon lifecycle around the agent run.
     """
 
     def __init__(self, **kwargs):
@@ -463,26 +634,33 @@ class ScraperWorkflow(Workflow):
         self._extra_tools: List = kwargs.get("extra_tools", [])
         self._headless: bool = kwargs.get("headless", True)
         self._max_steps: int = kwargs.get("max_steps", 10)
-        self._browser_tools: Optional[BrowserTools] = None
+        self._force_playwright: bool = kwargs.get("force_playwright", False)
+        self._backend = None
 
     @step
-    async def run_agent(self, ctx: Context, ev: StartEvent) -> StopEvent:
+    async def run_agent(self, ctx, ev: StartEvent) -> StopEvent:
         query = getattr(ev, "query", str(ev))
 
-        # Start browser
-        self._browser_tools = BrowserTools(headless=self._headless)
-        try:
-            self._browser_tools.start()
-        except Exception as e:
-            return StopEvent(result=f"Browser failed to start: {e}")
+        # Select backend
+        use_agent_browser = (not self._force_playwright) and _agent_browser_available()
+        backend_name = "agent-browser" if use_agent_browser else "Playwright"
 
-        scraper_tools = build_scraper_tools(self._browser_tools)
+        if use_agent_browser:
+            self._backend = AgentBrowserTools()
+        else:
+            self._backend = PlaywrightTools(headless=self._headless)
+            try:
+                self._backend.start()
+            except Exception as e:
+                return StopEvent(result=f"Browser failed to start ({backend_name}): {e}")
+
+        scraper_tools = _build_tools(self._backend)
         all_tools = scraper_tools + list(self._extra_tools)
 
         agent = FunctionAgent(
             tools=all_tools,
             llm=self._llm,
-            system_prompt=self._system_prompt,
+            system_prompt=self._system_prompt + f"\n\n[Backend: {backend_name}]",
             max_function_calls=self._max_steps,
             verbose=getattr(ctx, "_verbose", False),
         )
@@ -491,9 +669,10 @@ class ScraperWorkflow(Workflow):
             response = await agent.run(query)
             result = str(response)
         except Exception as e:
-            result = f"Scraper agent error: {e}"
+            result = f"Scraper agent error ({backend_name}): {e}"
         finally:
-            self._browser_tools.stop()
+            if not use_agent_browser and self._backend:
+                self._backend.stop()
 
         return StopEvent(result=result)
 
@@ -516,11 +695,13 @@ def get_workflow(window, kwargs: Dict[str, Any]) -> ScraperWorkflow:
     verbose = kwargs.get("verbose", False)
     max_steps = kwargs.get("max_iterations", 10)
 
-    # Read headless setting from preset options or global config
     headless = True
+    force_playwright = False
     preset = kwargs.get("preset")
     if preset and hasattr(preset, "extra"):
-        headless = preset.extra.get("scraper", {}).get("headless", True)
+        scraper_opts = preset.extra.get("scraper", {})
+        headless = scraper_opts.get("headless", True)
+        force_playwright = scraper_opts.get("force_playwright", False)
 
     return ScraperWorkflow(
         llm=llm,
@@ -529,4 +710,5 @@ def get_workflow(window, kwargs: Dict[str, Any]) -> ScraperWorkflow:
         verbose=verbose,
         max_steps=max_steps,
         headless=headless,
+        force_playwright=force_playwright,
     )

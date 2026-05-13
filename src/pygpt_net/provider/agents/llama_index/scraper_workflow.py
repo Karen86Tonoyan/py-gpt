@@ -52,9 +52,19 @@ class ScraperAgent(BaseAgent):
                 "options": {
                     "headless": {
                         "label": "Headless browser",
-                        "description": "Run browser in headless (no-window) mode",
+                        "description": "Run browser in headless (no-window) mode (Playwright backend only)",
                         "type": "bool",
                         "default": True,
+                    },
+                    "force_playwright": {
+                        "label": "Force Playwright backend",
+                        "description": (
+                            "Use Playwright even if agent-browser is installed. "
+                            "By default agent-browser (npm install -g agent-browser) is preferred "
+                            "for better AI-optimised element refs and JSON snapshots."
+                        ),
+                        "type": "bool",
+                        "default": False,
                     },
                 },
             },
