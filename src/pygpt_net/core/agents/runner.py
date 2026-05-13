@@ -79,6 +79,31 @@ class Runner:
         agent_id = extra.get("agent_provider", "openai")
         verbose = self.is_verbose()
 
+        # --- SECURITY: Cerberus input check ---
+        security = self.window.core.agents.security
+        is_safe, reason = security.check_input(
+            prompt=context.prompt or "",
+            system_prompt=context.system_prompt or "",
+        )
+        if not is_safe:
+            security.monitor("INPUT_BLOCKED", {
+                "agent_id": agent_id, "reason": reason,
+                "prompt_preview": (context.prompt or "")[:200],
+            })
+            if context.ctx:
+                context.ctx.output = f"[Cerberus] Input blocked: {reason}"
+                context.ctx.extra["agent_output"] = True
+            return False
+
+        # --- VISUALIZATION: agent start ---
+        visualization = self.window.core.agents.visualization
+        viz_session = f"{agent_id}_{id(context)}"
+        visualization.on_agent_start(agent_id, viz_session)
+
+        # --- SECURITY: Lasuchs start run ---
+        security.lasuchs.start_run(agent_id)
+        security.monitor("AGENT_START", {"agent_id": agent_id})
+
         try:
             # first, check if agent exists
             if not self.window.core.agents.provider.has(agent_id, context.mode):
@@ -193,25 +218,53 @@ class Runner:
             if schema:
                 kwargs["schema"] = schema
 
+            # --- VISUALIZATION: log user message ---
+            visualization.on_message(agent_id, "user", prompt[:2000])
+            security.monitor("AGENT_PROMPT", {"agent_id": agent_id, "length": len(prompt)})
+
+            result = False
             if mode == AGENT_MODE_PLAN:
-                return self.llama_plan.run(**kwargs)
+                result = self.llama_plan.run(**kwargs)
             elif mode == AGENT_MODE_STEP:
-                return self.llama_steps.run(**kwargs)
+                result = self.llama_steps.run(**kwargs)
             elif mode == AGENT_MODE_ASSISTANT:
-                return self.llama_assistant.run(**kwargs)
+                result = self.llama_assistant.run(**kwargs)
             elif mode == AGENT_MODE_WORKFLOW:
                 kwargs["history"] = history
                 kwargs["llm"] = llm
-                return asyncio.run(self.llama_workflow.run(**kwargs))
+                result = asyncio.run(self.llama_workflow.run(**kwargs))
             elif mode == AGENT_MODE_OPENAI:
                 kwargs["run"] = agent_run  # callable
                 kwargs["agent_kwargs"] = agent_kwargs  # as dict
-                kwargs["stream"] = is_stream # from global
-                return asyncio.run(self.openai_workflow.run(**kwargs))
+                kwargs["stream"] = is_stream  # from global
+                result = asyncio.run(self.openai_workflow.run(**kwargs))
+
+            # --- SECURITY: Guardian output check ---
+            output_text = ctx.output or ""
+            if output_text:
+                is_out_safe, out_reason = security.check_output(output_text, prompt)
+                if not is_out_safe:
+                    ctx.output = security.guardian.sanitize(output_text)
+                    security.monitor("OUTPUT_SANITIZED", {
+                        "agent_id": agent_id,
+                        "reason": out_reason,
+                    })
+
+            # --- VISUALIZATION + LASUCHS: agent stop ---
+            visualization.on_message(agent_id, "assistant", output_text[:2000])
+            visualization.on_agent_stop(agent_id, viz_session)
+            security.lasuchs.end_run(agent_id, success=bool(result))
+            security.monitor("AGENT_STOP", {"agent_id": agent_id, "success": bool(result)})
+
+            return result
 
         except Exception as e:
             self.window.core.debug.log(e)
             self.last_error = e
+            visualization.on_error(agent_id, str(e))
+            visualization.on_agent_stop(agent_id, viz_session)
+            security.lasuchs.end_run(agent_id, success=False)
+            security.monitor("AGENT_ERROR", {"agent_id": agent_id, "error": str(e)})
             return False
 
     def call_once(
