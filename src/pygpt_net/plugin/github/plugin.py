@@ -25,6 +25,7 @@ class Plugin(BasePlugin):
         self.prefix = "API"
         self.order = 100
         self.allowed_cmds =  [
+            "gh_check_key",
             "gh_device_begin",
             "gh_device_poll",
             "gh_set_pat",

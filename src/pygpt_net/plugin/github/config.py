@@ -129,6 +129,16 @@ class Config(BaseConfig):
 
         # ---------------- Commands ----------------
 
+        # Key check
+        plugin.add_cmd(
+            "gh_check_key",
+            instruction="Check if the configured GitHub token (PAT or OAuth) is valid and return the authenticated user info.",
+            params=[],
+            enabled=True,
+            description="Auth: check key",
+            tab="auth",
+        )
+
         # Auth
         plugin.add_cmd(
             "gh_device_begin",
