@@ -15,6 +15,11 @@ from .lasuchs import Lasuchs
 
 
 class Security:
+    MODE_STRICT = "strict"
+    MODE_BALANCED = "balanced"
+    MODE_RESEARCH = "research"
+    MODE_OFF = "off"
+
     def __init__(self, window=None):
         """
         Security middleware for agent pipeline.
@@ -28,8 +33,42 @@ class Security:
         self.lasuchs = Lasuchs(window)
         self.enabled = True
 
+    def get_mode(self) -> str:
+        """Return current security mode."""
+        if not self.enabled:
+            return self.MODE_OFF
+        if self.window is None:
+            return self.MODE_BALANCED
+        if not self.window.core.config.get("agent.security.enabled", True):
+            return self.MODE_OFF
+        mode = self.window.core.config.get("agent.security.mode", self.MODE_BALANCED)
+        if mode not in (
+                self.MODE_STRICT,
+                self.MODE_BALANCED,
+                self.MODE_RESEARCH,
+                self.MODE_OFF,
+        ):
+            return self.MODE_BALANCED
+        return mode
+
     def is_enabled(self) -> bool:
-        return self.enabled and self.window.core.config.get("agent.security.enabled", True)
+        return self.get_mode() != self.MODE_OFF
+
+    def should_block_input(self) -> bool:
+        """Return True if Cerberus should block input."""
+        mode = self.get_mode()
+        if mode == self.MODE_STRICT:
+            return True
+        if mode == self.MODE_BALANCED:
+            return self.window is None or self.window.core.config.get("agent.security.input.enabled", True)
+        return False
+
+    def should_filter_output(self) -> bool:
+        """Return True if Guardian should filter output."""
+        mode = self.get_mode()
+        if mode in (self.MODE_STRICT, self.MODE_BALANCED, self.MODE_RESEARCH):
+            return self.window is None or self.window.core.config.get("agent.security.output.enabled", True)
+        return False
 
     def check_input(self, prompt: str, system_prompt: str = "") -> tuple:
         """
@@ -39,7 +78,7 @@ class Security:
         :param system_prompt: current system prompt
         :return: (is_safe: bool, reason: str)
         """
-        if not self.is_enabled():
+        if not self.should_block_input():
             return True, ""
         return self.cerberus.check(prompt, system_prompt)
 
@@ -51,7 +90,7 @@ class Security:
         :param original_prompt: original user prompt
         :return: (is_safe: bool, reason: str)
         """
-        if not self.is_enabled():
+        if not self.should_filter_output():
             return True, ""
         return self.guardian.check(response, original_prompt)
 
