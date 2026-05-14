@@ -90,6 +90,23 @@ class AgentBrowserTools:
         self._timeout = timeout
         self._bin = "agent-browser"
 
+    def start(self):
+        """Verify agent-browser is accessible (no persistent state to open)."""
+        result = subprocess.run(
+            [self._bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"agent-browser responded with exit {result.returncode}: {result.stderr.strip()}"
+            )
+
+    def stop(self):
+        """No persistent browser process to close for agent-browser."""
+        pass
+
     def _run(self, *args: str) -> str:
         """Run an agent-browser command and return stdout."""
         cmd = [self._bin] + list(args)
@@ -649,10 +666,11 @@ class ScraperWorkflow(Workflow):
             self._backend = AgentBrowserTools()
         else:
             self._backend = PlaywrightTools(headless=self._headless)
-            try:
-                self._backend.start()
-            except Exception as e:
-                return StopEvent(result=f"Browser failed to start ({backend_name}): {e}")
+
+        try:
+            self._backend.start()
+        except Exception as e:
+            return StopEvent(result=f"Browser failed to start ({backend_name}): {e}")
 
         scraper_tools = _build_tools(self._backend)
         all_tools = scraper_tools + list(self._extra_tools)
@@ -671,7 +689,7 @@ class ScraperWorkflow(Workflow):
         except Exception as e:
             result = f"Scraper agent error ({backend_name}): {e}"
         finally:
-            if not use_agent_browser and self._backend:
+            if self._backend:
                 self._backend.stop()
 
         return StopEvent(result=result)

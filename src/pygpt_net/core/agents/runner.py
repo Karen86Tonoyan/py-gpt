@@ -34,6 +34,8 @@ from .runners.openai_workflow import OpenAIWorkflow
 from .runners.helpers import Helpers
 from .runners.loop import Loop
 
+from .security.lasuchs import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
+
 class Runner:
 
     APPEND_SYSTEM_PROMPT_TO_MSG = [
@@ -218,6 +220,9 @@ class Runner:
             if schema:
                 kwargs["schema"] = schema
 
+            # --- LASUCHS: wrap tools for per-call monitoring ---
+            tools = self._wrap_tools_for_monitoring(tools, agent_id, security, visualization)
+
             # --- VISUALIZATION: log user message ---
             visualization.on_message(agent_id, "user", prompt[:2000])
             security.monitor("AGENT_PROMPT", {"agent_id": agent_id, "length": len(prompt)})
@@ -245,6 +250,7 @@ class Runner:
                 is_out_safe, out_reason = security.check_output(output_text, prompt)
                 if not is_out_safe:
                     ctx.output = security.guardian.sanitize(output_text)
+                    output_text = ctx.output  # use sanitized text for visualization/logs
                     security.monitor("OUTPUT_SANITIZED", {
                         "agent_id": agent_id,
                         "reason": out_reason,
@@ -372,6 +378,48 @@ class Runner:
         except Exception as e:
             self.window.core.debug.log(e)
             self.last_error = e
+
+    def _wrap_tools_for_monitoring(self, tools, agent_id, security, visualization):
+        """
+        Wrap each LlamaIndex FunctionTool to emit Lasuchs + visualization events
+        on every tool invocation.  This is what makes Lasuchs loop detection work
+        (counts per tool per run) and what populates pixel-agents PreToolUse /
+        PostToolUse events.
+
+        Tool instances produced by tools.prepare() are fresh per Runner.call()
+        so in-place mutation of _fn is safe.
+        """
+        wrapped = []
+        for tool in tools:
+            fn = getattr(tool, "_fn", None)
+            if fn is None:
+                wrapped.append(tool)
+                continue
+            tool_name = getattr(getattr(tool, "metadata", None), "name", "unknown")
+
+            def _make_wrapper(original_fn, tname):
+                def _monitored(**kwargs):
+                    security.lasuchs.record(EVENT_TOOL_CALL, {
+                        "agent_id": agent_id,
+                        "tool": tname,
+                        "params_preview": str(kwargs)[:200],
+                    })
+                    visualization.on_tool_start(agent_id, tname, kwargs)
+                    result = original_fn(**kwargs)
+                    security.lasuchs.record(EVENT_TOOL_RESULT, {
+                        "agent_id": agent_id,
+                        "tool": tname,
+                    })
+                    visualization.on_tool_result(agent_id, tname, str(result)[:500])
+                    return result
+
+                _monitored.__name__ = getattr(original_fn, "__name__", tname)
+                _monitored.__doc__ = getattr(original_fn, "__doc__", "")
+                return _monitored
+
+            tool._fn = _make_wrapper(fn, tool_name)
+            wrapped.append(tool)
+        return wrapped
 
     def is_verbose(self) -> bool:
         """
