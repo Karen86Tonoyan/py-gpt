@@ -18,6 +18,7 @@ from .runner import Runner
 from .tools import Tools
 from .security import Security
 from .visualization import Visualization
+from .alfa_eos import AlfaEOS
 
 
 class Agents:
@@ -37,3 +38,4 @@ class Agents:
         self.tools = Tools(window)
         self.security = Security(window)
         self.visualization = Visualization(window)
+        self.alfa_eos = AlfaEOS()
