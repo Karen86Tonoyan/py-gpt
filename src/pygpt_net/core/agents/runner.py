@@ -152,6 +152,19 @@ class Runner:
                 plugin_specs = []
                 tools = []
 
+            # --- SECURITY/VISUALIZATION: wrap ALL tool types BEFORE agent captures them ---
+            # Wrapping here ensures the agent (and scraper workflow) receive already-instrumented
+            # callables — no tools escape Lasuchs monitoring regardless of provider.
+            tools = self._wrap_tools_for_monitoring(
+                tools, agent_id, security, visualization
+            )
+            plugin_tools = self._wrap_plugin_tools_for_monitoring(
+                plugin_tools, agent_id, security, visualization
+            )
+            function_tools = self._wrap_function_tools_for_monitoring(
+                function_tools, agent_id, security, visualization
+            )
+
             # --- ADDITIONAL CONTEXT ---
             # append additional context from RAG if available
             if (vector_store_idx
@@ -219,9 +232,6 @@ class Runner:
             }
             if schema:
                 kwargs["schema"] = schema
-
-            # --- LASUCHS: wrap tools for per-call monitoring ---
-            tools = self._wrap_tools_for_monitoring(tools, agent_id, security, visualization)
 
             # --- VISUALIZATION: log user message ---
             visualization.on_message(agent_id, "user", prompt[:2000])
@@ -379,45 +389,120 @@ class Runner:
             self.window.core.debug.log(e)
             self.last_error = e
 
-    def _wrap_tools_for_monitoring(self, tools, agent_id, security, visualization):
-        """
-        Wrap each LlamaIndex FunctionTool to emit Lasuchs + visualization events
-        on every tool invocation.  This is what makes Lasuchs loop detection work
-        (counts per tool per run) and what populates pixel-agents PreToolUse /
-        PostToolUse events.
+    # ------------------------------------------------------------------
+    # Tool monitoring helpers
+    # ------------------------------------------------------------------
 
-        Tool instances produced by tools.prepare() are fresh per Runner.call()
-        so in-place mutation of _fn is safe.
+    @staticmethod
+    def _make_sync_wrapper(original_fn, tname, agent_id, security, visualization):
         """
+        Build a synchronous monitoring wrapper around a tool callable.
+        Supports both positional (*args) and keyword (**kwargs) invocations.
+        Sanitizes tool output to prevent secrets reaching streaming UI (Blocker 4).
+        Logs failures so Lasuchs audit is complete even on errors (Blocker 3).
+        """
+        def _monitored(*args, **kwargs):
+            security.lasuchs.record(EVENT_TOOL_CALL, {
+                "agent_id": agent_id,
+                "tool": tname,
+                "params_preview": str(kwargs or args)[:200],
+            })
+            visualization.on_tool_start(agent_id, tname, dict(kwargs))
+            try:
+                result = original_fn(*args, **kwargs)
+                # Sanitize tool output at call site — blocks secrets reaching
+                # streaming UI before final Guardian check (Blocker 4).
+                result_str = str(result)
+                is_safe, _ = security.check_output(result_str)
+                if not is_safe:
+                    result_str = security.guardian.sanitize(result_str)
+                    result = result_str
+                security.lasuchs.record(EVENT_TOOL_RESULT, {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                })
+                visualization.on_tool_result(agent_id, tname, result_str[:500])
+                return result
+            except Exception as exc:
+                security.lasuchs.record("tool_error", {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                    "error": str(exc)[:300],
+                })
+                raise
+
+        _monitored.__name__ = getattr(original_fn, "__name__", tname)
+        _monitored.__doc__ = getattr(original_fn, "__doc__", "")
+        return _monitored
+
+    @staticmethod
+    def _make_async_wrapper(original_fn, tname, agent_id, security, visualization):
+        """Async variant for OpenAI FunctionTool.on_invoke_tool callbacks."""
+        async def _monitored_async(run_ctx, args_str):
+            security.lasuchs.record(EVENT_TOOL_CALL, {
+                "agent_id": agent_id,
+                "tool": tname,
+                "params_preview": str(args_str)[:200],
+            })
+            visualization.on_tool_start(agent_id, tname, {"args": args_str[:200]})
+            try:
+                result = await original_fn(run_ctx, args_str)
+                result_str = str(result)
+                is_safe, _ = security.check_output(result_str)
+                if not is_safe:
+                    result_str = security.guardian.sanitize(result_str)
+                    result = result_str
+                security.lasuchs.record(EVENT_TOOL_RESULT, {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                })
+                visualization.on_tool_result(agent_id, tname, result_str[:500])
+                return result
+            except Exception as exc:
+                security.lasuchs.record("tool_error", {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                    "error": str(exc)[:300],
+                })
+                raise
+
+        return _monitored_async
+
+    def _wrap_tools_for_monitoring(self, tools, agent_id, security, visualization):
+        """Instrument LlamaIndex BaseTool list (wraps tool._fn in-place)."""
         wrapped = []
         for tool in tools:
             fn = getattr(tool, "_fn", None)
             if fn is None:
                 wrapped.append(tool)
                 continue
-            tool_name = getattr(getattr(tool, "metadata", None), "name", "unknown")
+            tname = getattr(getattr(tool, "metadata", None), "name", "unknown")
+            tool._fn = self._make_sync_wrapper(fn, tname, agent_id, security, visualization)
+            wrapped.append(tool)
+        return wrapped
 
-            def _make_wrapper(original_fn, tname):
-                def _monitored(**kwargs):
-                    security.lasuchs.record(EVENT_TOOL_CALL, {
-                        "agent_id": agent_id,
-                        "tool": tname,
-                        "params_preview": str(kwargs)[:200],
-                    })
-                    visualization.on_tool_start(agent_id, tname, kwargs)
-                    result = original_fn(**kwargs)
-                    security.lasuchs.record(EVENT_TOOL_RESULT, {
-                        "agent_id": agent_id,
-                        "tool": tname,
-                    })
-                    visualization.on_tool_result(agent_id, tname, str(result)[:500])
-                    return result
+    def _wrap_plugin_tools_for_monitoring(self, plugin_tools, agent_id, security, visualization):
+        """Instrument plugin_tools dict (str -> callable)."""
+        if not isinstance(plugin_tools, dict):
+            return plugin_tools
+        wrapped = {}
+        for tname, fn in plugin_tools.items():
+            if callable(fn):
+                wrapped[tname] = self._make_sync_wrapper(fn, tname, agent_id, security, visualization)
+            else:
+                wrapped[tname] = fn
+        return wrapped
 
-                _monitored.__name__ = getattr(original_fn, "__name__", tname)
-                _monitored.__doc__ = getattr(original_fn, "__doc__", "")
-                return _monitored
-
-            tool._fn = _make_wrapper(fn, tool_name)
+    def _wrap_function_tools_for_monitoring(self, function_tools, agent_id, security, visualization):
+        """Instrument OpenAI FunctionTool list (wraps on_invoke_tool in-place)."""
+        wrapped = []
+        for tool in function_tools:
+            fn = getattr(tool, "on_invoke_tool", None)
+            if fn is None:
+                wrapped.append(tool)
+                continue
+            tname = getattr(tool, "name", "unknown")
+            tool.on_invoke_tool = self._make_async_wrapper(fn, tname, agent_id, security, visualization)
             wrapped.append(tool)
         return wrapped
 

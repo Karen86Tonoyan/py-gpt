@@ -634,11 +634,65 @@ class ScraperInputEvent(StartEvent):
 # Scraper Workflow
 # ---------------------------------------------------------------------------
 
+def _apply_tool_callbacks(tools: List[FunctionTool], callbacks: Optional[dict]) -> List[FunctionTool]:
+    """
+    Wrap each FunctionTool._fn with monitoring callbacks supplied by Runner.
+    This ensures scraper-specific tools (web_scrape, maps_search, etc.) are
+    visible to Lasuchs and pixel-agents even though they are built inside the
+    workflow rather than by the Runner's prepare() path.
+
+    :param tools: list of FunctionTool instances from _build_tools()
+    :param callbacks: dict with keys on_call, on_result, guardian (may be None)
+    :return: same list with _fn replaced on each tool
+    """
+    if not callbacks:
+        return tools
+    on_call = callbacks.get("on_call")
+    on_result = callbacks.get("on_result")
+    guardian = callbacks.get("guardian")
+
+    for tool in tools:
+        fn = getattr(tool, "_fn", None)
+        if fn is None:
+            continue
+        tname = getattr(getattr(tool, "metadata", None), "name", "unknown")
+
+        def _make(original_fn, tname=tname):
+            def _monitored(*args, **kwargs):
+                if on_call:
+                    on_call(tname, dict(kwargs) or list(args))
+                try:
+                    result = original_fn(*args, **kwargs)
+                    result_str = str(result)
+                    if guardian:
+                        is_safe, _ = guardian.check(result_str)
+                        if not is_safe:
+                            result_str = guardian.sanitize(result_str)
+                            result = result_str
+                    if on_result:
+                        on_result(tname, result_str)
+                    return result
+                except Exception as exc:
+                    if on_result:
+                        on_result(tname, f"ERROR: {exc}")
+                    raise
+            _monitored.__name__ = getattr(original_fn, "__name__", tname)
+            _monitored.__doc__ = getattr(original_fn, "__doc__", "")
+            return _monitored
+
+        tool._fn = _make(fn)
+    return tools
+
+
 class ScraperWorkflow(Workflow):
     """
     LlamaIndex Workflow wrapping a browser-enabled FunctionAgent.
     Selects agent-browser CLI backend (preferred) or Playwright (fallback).
     Manages browser/daemon lifecycle around the agent run.
+
+    Accepts optional `tool_callbacks` dict from Runner (via get_workflow) so
+    scraper tools are visible to Lasuchs monitoring and pixel-agents visualization
+    even though they are built internally rather than by Runner.prepare().
     """
 
     def __init__(self, **kwargs):
@@ -652,6 +706,7 @@ class ScraperWorkflow(Workflow):
         self._headless: bool = kwargs.get("headless", True)
         self._max_steps: int = kwargs.get("max_steps", 10)
         self._force_playwright: bool = kwargs.get("force_playwright", False)
+        self._tool_callbacks: Optional[dict] = kwargs.get("tool_callbacks")
         self._backend = None
 
     @step
@@ -673,6 +728,8 @@ class ScraperWorkflow(Workflow):
             return StopEvent(result=f"Browser failed to start ({backend_name}): {e}")
 
         scraper_tools = _build_tools(self._backend)
+        # Wrap scraper tools with monitoring callbacks so Lasuchs sees every call
+        scraper_tools = _apply_tool_callbacks(scraper_tools, self._tool_callbacks)
         all_tools = scraper_tools + list(self._extra_tools)
 
         agent = FunctionAgent(
@@ -721,6 +778,43 @@ def get_workflow(window, kwargs: Dict[str, Any]) -> ScraperWorkflow:
         headless = scraper_opts.get("headless", True)
         force_playwright = scraper_opts.get("force_playwright", False)
 
+    # Build monitoring callbacks from window so scraper tools are visible to
+    # Lasuchs and pixel-agents (they are built inside the workflow, not by Runner).
+    tool_callbacks = None
+    if window:
+        try:
+            from pygpt_net.core.agents.security.lasuchs import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
+            security = window.core.agents.security
+            visualization = window.core.agents.visualization
+            agent_id = "scraper"
+
+            def _on_call(tname, params):
+                security.lasuchs.record(EVENT_TOOL_CALL, {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                    "params_preview": str(params)[:200],
+                })
+                visualization.on_tool_start(
+                    agent_id,
+                    tname,
+                    params if isinstance(params, dict) else {},
+                )
+
+            def _on_result(tname, result_str):
+                security.lasuchs.record(EVENT_TOOL_RESULT, {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                })
+                visualization.on_tool_result(agent_id, tname, result_str[:500])
+
+            tool_callbacks = {
+                "on_call": _on_call,
+                "on_result": _on_result,
+                "guardian": security.guardian,
+            }
+        except Exception:
+            pass  # monitoring is best-effort; never break the workflow
+
     return ScraperWorkflow(
         llm=llm,
         system_prompt=system_prompt,
@@ -729,4 +823,5 @@ def get_workflow(window, kwargs: Dict[str, Any]) -> ScraperWorkflow:
         max_steps=max_steps,
         headless=headless,
         force_playwright=force_playwright,
+        tool_callbacks=tool_callbacks,
     )
