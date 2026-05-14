@@ -58,7 +58,9 @@ class Worker(BaseWorker):
                     if item["cmd"] in self.plugin.allowed_cmds and self.plugin.has_cmd(item["cmd"]):
 
                         # -------- Auth --------
-                        if item["cmd"] == "gh_device_begin":
+                        if item["cmd"] == "gh_check_key":
+                            response = self.cmd_gh_check_key(item)
+                        elif item["cmd"] == "gh_device_begin":
                             response = self.cmd_gh_device_begin(item)
                         elif item["cmd"] == "gh_device_poll":
                             response = self.cmd_gh_device_poll(item)
@@ -325,6 +327,35 @@ class Worker(BaseWorker):
         raise RuntimeError("Device flow timeout.")
 
     # ---------------------- Auth commands ----------------------
+
+    def cmd_gh_check_key(self, item: dict) -> dict:
+        token, scheme = self._resolve_token()
+        if not token:
+            return self.make_response(item, {
+                "valid": False,
+                "error": "No token configured. Set a PAT or complete OAuth Device Flow.",
+            })
+        try:
+            res = self._get("/user")
+            data = res.get("data") or res
+            login = data.get("login")
+            user_id = data.get("id")
+            if login:
+                self.plugin.set_option_value("username", login)
+            if user_id:
+                self.plugin.set_option_value("user_id", str(user_id))
+            return self.make_response(item, {
+                "valid": True,
+                "scheme": scheme,
+                "token_prefix": token[:4] + "****",
+                "login": login,
+                "id": user_id,
+                "name": data.get("name"),
+                "email": data.get("email"),
+                "scopes": res.get("_meta", {}).get("X-OAuth-Scopes"),
+            })
+        except Exception as e:
+            return self.make_response(item, {"valid": False, "error": str(e)})
 
     def cmd_gh_device_begin(self, item: dict) -> dict:
         p = item.get("params", {})
