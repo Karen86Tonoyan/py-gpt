@@ -287,6 +287,7 @@ class ExecutionPermission:
     risk_score: float
     policy_context: str
     provenance_chain: Dict[str, Any]    # audit trail
+    expires_at: Optional[datetime] = None
 
     @staticmethod
     def deny(claim_id: str, reason: str, risk_score: float = 1.0) -> "ExecutionPermission":
@@ -300,8 +301,13 @@ class ExecutionPermission:
         )
 
     @staticmethod
-    def grant(claim_id: str, reason: str, risk_score: float,
-              provenance_chain: Dict[str, Any]) -> "ExecutionPermission":
+    def grant(
+        claim_id: str,
+        reason: str,
+        risk_score: float,
+        provenance_chain: Dict[str, Any],
+        expires_at: Optional[datetime] = None,
+    ) -> "ExecutionPermission":
         return ExecutionPermission(
             granted=True,
             claim_id=claim_id,
@@ -309,4 +315,5 @@ class ExecutionPermission:
             risk_score=risk_score,
             policy_context="",
             provenance_chain=provenance_chain,
+            expires_at=expires_at,
         )

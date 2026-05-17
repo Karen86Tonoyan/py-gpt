@@ -19,7 +19,7 @@ Usage:
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from .events import EventLog
@@ -39,6 +39,7 @@ from .services import (
     ClaimService,
     DriftService,
     EvidenceService,
+    PermissionExpiryService,
     ReplayService,
     SnapshotService,
 )
@@ -82,10 +83,12 @@ class AlfaEOS:
         self.snapshots    = SnapshotService(self.event_log, schema_version)
         self.drift        = DriftService(self.event_log)
         self.replay       = ReplayService()
+        self.expiry       = PermissionExpiryService(self.event_log, agent_id)
 
         self._state_machine     = EpistemicStateMachine()
         self._invariant_checker = InvariantChecker()
         self._normalizer        = ClaimNormalizer()
+        self._active_grants: List[ExecutionPermission] = []
 
     # ------------------------------------------------------------------
     # Claims
@@ -162,7 +165,7 @@ class AlfaEOS:
         if not gate_result.passed:
             return None
 
-        self.claims.attach_evidence(claim_id, ev, new_confidence or 0.0)
+        self.claims.attach_evidence(claim_id, ev, new_confidence)
 
         # Auto-transition based on new confidence
         inferred = self.evidence.infer_target_status(claim_id, self.policy)
@@ -176,7 +179,9 @@ class AlfaEOS:
     # Execution gate
     # ------------------------------------------------------------------
 
-    def request_execution(self, claim_id: str) -> ExecutionPermission:
+    def request_execution(
+        self, claim_id: str, expires_at: Optional[datetime] = None
+    ) -> ExecutionPermission:
         """
         Request execution permission for a claim.
         Checks INVARIANT_01 and INVARIANT_08.
@@ -186,6 +191,17 @@ class AlfaEOS:
         if not claim:
             return ExecutionPermission.deny(claim_id, "Claim not found.")
 
+        # No evidence basis — epistemically distinct from low confidence.
+        # Skip for already-VERIFIED claims: trust the prior verification.
+        if claim.status != ClaimStatus.VERIFIED and claim.confidence == 0.0 and not claim.evidence_ref:
+            confidence_from_evidence = self.evidence.compute_confidence(claim_id)
+            if confidence_from_evidence is None:
+                return ExecutionPermission.deny(
+                    claim_id,
+                    "INSUFFICIENT_EVIDENCE: no admitted evidence.",
+                    risk_score=1.0,
+                )
+
         if not self._state_machine.can_execute(claim.status):
             return ExecutionPermission.deny(
                 claim_id,
@@ -193,7 +209,7 @@ class AlfaEOS:
                 risk_score=1.0,
             )
 
-        risk_score = 1.0 - claim.confidence
+        risk_score = 1.0 - (claim.confidence or 0.0)
         perm = ExecutionPermission.grant(
             claim_id=claim_id,
             reason=f"Status={claim.status.value}, confidence={claim.confidence:.2f}",
@@ -202,6 +218,7 @@ class AlfaEOS:
                 "evidence_ids": claim.evidence_ref,
                 "policy_domain": self.domain,
             },
+            expires_at=expires_at,
         )
 
         # INVARIANT_08 check
@@ -215,7 +232,18 @@ class AlfaEOS:
                 risk_score=risk_score,
             )
 
+        self._active_grants.append(perm)
         return perm
+
+    def sweep_expired_permissions(
+        self, now: Optional[datetime] = None
+    ) -> List[str]:
+        """Sweep active grants for expired permissions. Returns list of expired claim_ids."""
+        expired_ids = self.expiry.sweep(self._active_grants, now or datetime.now())
+        self._active_grants = [
+            g for g in self._active_grants if g.claim_id not in expired_ids
+        ]
+        return expired_ids
 
     # ------------------------------------------------------------------
     # Arbitration

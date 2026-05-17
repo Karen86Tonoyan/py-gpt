@@ -131,16 +131,23 @@ class EvidenceService:
     # Confidence computation
     # ------------------------------------------------------------------
 
-    def compute_confidence(self, claim_id: str) -> float:
+    def compute_confidence(self, claim_id: str) -> Optional[float]:
         """
         RFC §8.4 formula:
             confidence = Σ(w_i × f_i × c_i|SUPPORTS) / Σ(w_i|SUPPORTS)
                        − Σ(w_j × f_j × c_j|REFUTES) / Σ(w_j|REFUTES)
         Clamped to [0.0, 1.0].
+
+        Return semantics (critical — do not conflate):
+        - None   → no admitted evidence at all (INSUFFICIENT_EVIDENCE, not zero)
+        - 0.0    → evidence exists but SUPPORTS and REFUTES perfectly balance
+                   (or only zero-weight evidence); infer_target_status → CONFLICT
+        - >0.0   → net positive support
+        Σ(w)=0 guard: `denominator or 1.0` prevents ZeroDivisionError.
         """
         evs = self._evidence_for_claim(claim_id)
         if not evs:
-            return 0.0
+            return None   # no basis — epistemically distinct from refuted
 
         supports = [e for e in evs if e.support_type == SupportType.SUPPORTS]
         refutes  = [e for e in evs if e.support_type == SupportType.REFUTES]
@@ -149,7 +156,7 @@ class EvidenceService:
             if not evidence_list:
                 return 0.0
             numerator   = sum(e.weight * e.freshness * e.consistency for e in evidence_list)
-            denominator = sum(e.weight for e in evidence_list) or 1.0
+            denominator = sum(e.weight for e in evidence_list) or 1.0   # Σ(w)=0 guard
             return numerator / denominator
 
         confidence = _weighted_avg(supports) - _weighted_avg(refutes)
@@ -161,8 +168,14 @@ class EvidenceService:
         """
         Infer what ClaimStatus the confidence score warrants given policy thresholds.
         VERIFIED requires both confidence threshold AND minimum corroboration sources.
+        None confidence (no evidence) → EVIDENCE_REQUIRED.
         """
         confidence = self.compute_confidence(claim_id)
+
+        # No evidence at all — distinct from conflict
+        if confidence is None:
+            return ClaimStatus.EVIDENCE_REQUIRED
+
         evs = self._evidence_for_claim(claim_id)
         has_refuting = any(e.support_type == SupportType.REFUTES for e in evs)
         has_supporting = any(e.support_type == SupportType.SUPPORTS for e in evs)

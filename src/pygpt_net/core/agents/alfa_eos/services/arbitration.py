@@ -20,6 +20,7 @@ Arbitration protocol:
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -81,6 +82,7 @@ class ArbitrationService:
         self._agent_id = agent_id
         self._invariant_checker = InvariantChecker()
         self._state_machine = EpistemicStateMachine()
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Session management
@@ -198,28 +200,32 @@ class ArbitrationService:
         return None
 
     def _apply_timeout(self, record: ArbitrationRecord) -> Optional[ClaimStatus]:
-        action = record.timeout_action
-        resolution_map = {
-            "DENY":             ClaimStatus.UNVERIFIED,
-            "DEFER":            ClaimStatus.CONFLICT,    # stay in CONFLICT
-            "HUMAN_ESCALATION": ClaimStatus.CONFLICT,    # stays, triggers escalation
-        }
-        resolution = resolution_map.get(action, ClaimStatus.UNVERIFIED)
+        with self._lock:
+            if record.is_resolved:
+                return record.resolution
 
-        self._log.emit(
-            EventType.ARBITRATION_TIMEOUT,
-            agent_id=self._agent_id,
-            payload={
-                "arbitration_id": record.arbitration_id,
-                "timeout_action": action,
-                "resolution": resolution.value,
-            },
-            claim_id=record.claim_id,
-        )
+            action = record.timeout_action
+            resolution_map = {
+                "DENY":             ClaimStatus.UNVERIFIED,
+                "DEFER":            ClaimStatus.CONFLICT,    # stay in CONFLICT
+                "HUMAN_ESCALATION": ClaimStatus.CONFLICT,    # stays, triggers escalation
+            }
+            resolution = resolution_map.get(action, ClaimStatus.UNVERIFIED)
 
-        record.resolved_at = datetime.now(timezone.utc)
-        record.resolution = resolution
-        return resolution if action != "DEFER" else None
+            self._log.emit(
+                EventType.ARBITRATION_TIMEOUT,
+                agent_id=self._agent_id,
+                payload={
+                    "arbitration_id": record.arbitration_id,
+                    "timeout_action": action,
+                    "resolution": resolution.value,
+                },
+                claim_id=record.claim_id,
+            )
+
+            record.resolved_at = datetime.now(timezone.utc)
+            record.resolution = resolution
+            return resolution if action != "DEFER" else None
 
     def _finalise(
         self,
@@ -227,20 +233,24 @@ class ArbitrationService:
         resolution: ClaimStatus,
         by_agent: str = "system",
     ) -> ArbitrationRecord:
-        record.resolved_at = datetime.now(timezone.utc)
-        record.resolution = resolution
+        with self._lock:
+            if record.is_resolved:
+                return record
 
-        self._log.emit(
-            EventType.ARBITRATION_RESOLVED,
-            agent_id=by_agent,
-            payload={
-                "arbitration_id": record.arbitration_id,
-                "resolution": resolution.value,
-                "opinion_count": len(record.opinions),
-                "risk_score": record.risk_score,
-            },
-            claim_id=record.claim_id,
-        )
+            record.resolved_at = datetime.now(timezone.utc)
+            record.resolution = resolution
+
+            self._log.emit(
+                EventType.ARBITRATION_RESOLVED,
+                agent_id=by_agent,
+                payload={
+                    "arbitration_id": record.arbitration_id,
+                    "resolution": resolution.value,
+                    "opinion_count": len(record.opinions),
+                    "risk_score": record.risk_score,
+                },
+                claim_id=record.claim_id,
+            )
         return record
 
     # ------------------------------------------------------------------

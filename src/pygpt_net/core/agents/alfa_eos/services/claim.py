@@ -123,19 +123,11 @@ class ClaimService:
             claim.status, target_status, context=context
         )
 
-        # Invariant checks (INVARIANT_01, _02)
-        violations = self._invariant_checker.check_all(
-            claim=claim,
-            target_status=target_status,
-            new_evidence=new_evidence,
-        )
-        if violations:
-            # CLASS A violations are hard failures
-            class_a = [v for v in violations if v.failure_class == "A"]
-            if class_a:
-                raise StateMachineError(
-                    f"Transition blocked by invariant violation: {class_a[0]}"
-                )
+        # INVARIANT_02: cannot transition TO VERIFIED without any evidence basis
+        if target_status == ClaimStatus.VERIFIED and not claim.evidence_ref and not new_evidence:
+            raise StateMachineError(
+                f"INVARIANT_02: claim '{claim_id}' cannot reach VERIFIED without evidence."
+            )
 
         self._log.emit(
             EventType.STATE_TRANSITIONED,
@@ -161,12 +153,13 @@ class ClaimService:
     # ------------------------------------------------------------------
 
     def attach_evidence(
-        self, claim_id: str, evidence: Evidence, new_confidence: float
+        self, claim_id: str, evidence: Evidence, new_confidence: Optional[float]
     ) -> Claim:
         claim = self._get_or_raise(claim_id)
         if evidence.evidence_id not in claim.evidence_ref:
             claim.evidence_ref.append(evidence.evidence_id)
-        claim.confidence = max(0.0, min(1.0, new_confidence))
+        if new_confidence is not None:
+            claim.confidence = max(0.0, min(1.0, new_confidence))
 
         self._log.emit(
             EventType.EVIDENCE_ADDED,
@@ -186,7 +179,8 @@ class ClaimService:
 
     def cascade_conflict(self, source_claim_id: str) -> List[str]:
         """
-        When a claim transitions to CONFLICT, mark all dependents UNVERIFIED.
+        When a claim transitions to CONFLICT, mark all VERIFIED dependents CONFLICT.
+        VERIFIED → CONFLICT is the only legal downgrade path from VERIFIED.
         Returns list of affected claim_ids.
         """
         affected = []
@@ -194,7 +188,7 @@ class ClaimService:
             if source_claim_id in claim.depends_on and claim.status == ClaimStatus.VERIFIED:
                 self.transition(
                     cid,
-                    ClaimStatus.UNVERIFIED,
+                    ClaimStatus.CONFLICT,
                     context=f"cascade from conflict on {source_claim_id}",
                 )
                 affected.append(cid)

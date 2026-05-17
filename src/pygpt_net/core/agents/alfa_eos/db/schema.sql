@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS event_store (
                         'ARBITRATION_STARTED', 'ARBITRATION_RESOLVED', 'ARBITRATION_TIMEOUT',
                         'DRIFT_DETECTED',
                         'SNAPSHOT_CREATED',
-                        'EXECUTION_GRANTED', 'EXECUTION_DENIED',
+                        'EXECUTION_GRANTED', 'EXECUTION_DENIED', 'EXECUTION_PERMISSION_EXPIRED',
                         'DEPENDENCY_ADDED',
                         'POLICY_CHANGED',
                         'INVARIANT_VIOLATED'
@@ -284,15 +284,32 @@ CREATE INDEX IF NOT EXISTS ix_ep_active_grants
 -- Expired grants auto-revocation (run periodically by a maintenance job)
 CREATE OR REPLACE FUNCTION fn_revoke_expired_permissions()
 RETURNS void LANGUAGE plpgsql AS $$
+DECLARE r RECORD;
 BEGIN
     PERFORM set_config('alfa_eos.replay_context', 'true', true);
-    UPDATE execution_permissions
-    SET    granted       = false,
-           revoked_at    = now(),
-           revoked_reason = 'TIMEOUT_FALLBACK: Permission expired without arbitration resolution.'
-    WHERE  granted = true
-    AND    revoked_at IS NULL
-    AND    expires_at < now();
+    FOR r IN
+        SELECT permission_id, claim_id
+        FROM   execution_permissions
+        WHERE  granted = true AND revoked_at IS NULL AND expires_at < now()
+    LOOP
+        -- Emit event FIRST (event-sourcing purity: log before projection mutation)
+        INSERT INTO event_store (event_type, stream_id, correlation_id, claim_id, agent_id, payload)
+        VALUES (
+            'EXECUTION_PERMISSION_EXPIRED',
+            gen_random_uuid(),
+            gen_random_uuid(),
+            r.claim_id,
+            'EXPIRY_SWEEP',
+            jsonb_build_object('permission_id', r.permission_id)
+        );
+
+        -- Then update the projection row
+        UPDATE execution_permissions
+        SET    granted        = false,
+               revoked_at     = now(),
+               revoked_reason = 'TIMEOUT_FALLBACK: Permission expired.'
+        WHERE  permission_id = r.permission_id;
+    END LOOP;
 END;
 $$;
 
