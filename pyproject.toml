@@ -132,6 +132,9 @@ pytest = "^7.4.3"
 [tool.poetry.scripts]
 pygpt = 'pygpt_net.app:run'
 
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
