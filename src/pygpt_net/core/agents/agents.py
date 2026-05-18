@@ -16,6 +16,10 @@ from .observer import Observer
 from .provider import Provider
 from .runner import Runner
 from .tools import Tools
+from .security import Security
+from .visualization import Visualization
+from .alfa_eos import AlfaEOS
+
 
 class Agents:
     def __init__(self, window=None):
@@ -32,3 +36,6 @@ class Agents:
         self.provider = Provider(window)
         self.runner = Runner(window)
         self.tools = Tools(window)
+        self.security = Security(window)
+        self.visualization = Visualization(window)
+        self.alfa_eos = AlfaEOS()

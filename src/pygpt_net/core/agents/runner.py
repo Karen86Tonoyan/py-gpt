@@ -34,6 +34,8 @@ from .runners.openai_workflow import OpenAIWorkflow
 from .runners.helpers import Helpers
 from .runners.loop import Loop
 
+from .security.lasuchs import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
+
 class Runner:
 
     APPEND_SYSTEM_PROMPT_TO_MSG = [
@@ -78,6 +80,31 @@ class Runner:
 
         agent_id = extra.get("agent_provider", "openai")
         verbose = self.is_verbose()
+
+        # --- SECURITY: Cerberus input check ---
+        security = self.window.core.agents.security
+        is_safe, reason = security.check_input(
+            prompt=context.prompt or "",
+            system_prompt=context.system_prompt or "",
+        )
+        if not is_safe:
+            security.monitor("INPUT_BLOCKED", {
+                "agent_id": agent_id, "reason": reason,
+                "prompt_preview": (context.prompt or "")[:200],
+            })
+            if context.ctx:
+                context.ctx.output = f"[Cerberus] Input blocked: {reason}"
+                context.ctx.extra["agent_output"] = True
+            return False
+
+        # --- VISUALIZATION: agent start ---
+        visualization = self.window.core.agents.visualization
+        viz_session = f"{agent_id}_{id(context)}"
+        visualization.on_agent_start(agent_id, viz_session)
+
+        # --- SECURITY: Lasuchs start run ---
+        security.lasuchs.start_run(agent_id)
+        security.monitor("AGENT_START", {"agent_id": agent_id})
 
         try:
             # first, check if agent exists
@@ -124,6 +151,19 @@ class Runner:
                 plugin_tools = []
                 plugin_specs = []
                 tools = []
+
+            # --- SECURITY/VISUALIZATION: wrap ALL tool types BEFORE agent captures them ---
+            # Wrapping here ensures the agent (and scraper workflow) receive already-instrumented
+            # callables — no tools escape Lasuchs monitoring regardless of provider.
+            tools = self._wrap_tools_for_monitoring(
+                tools, agent_id, security, visualization
+            )
+            plugin_tools = self._wrap_plugin_tools_for_monitoring(
+                plugin_tools, agent_id, security, visualization
+            )
+            function_tools = self._wrap_function_tools_for_monitoring(
+                function_tools, agent_id, security, visualization
+            )
 
             # --- ADDITIONAL CONTEXT ---
             # append additional context from RAG if available
@@ -193,25 +233,54 @@ class Runner:
             if schema:
                 kwargs["schema"] = schema
 
+            # --- VISUALIZATION: log user message ---
+            visualization.on_message(agent_id, "user", prompt[:2000])
+            security.monitor("AGENT_PROMPT", {"agent_id": agent_id, "length": len(prompt)})
+
+            result = False
             if mode == AGENT_MODE_PLAN:
-                return self.llama_plan.run(**kwargs)
+                result = self.llama_plan.run(**kwargs)
             elif mode == AGENT_MODE_STEP:
-                return self.llama_steps.run(**kwargs)
+                result = self.llama_steps.run(**kwargs)
             elif mode == AGENT_MODE_ASSISTANT:
-                return self.llama_assistant.run(**kwargs)
+                result = self.llama_assistant.run(**kwargs)
             elif mode == AGENT_MODE_WORKFLOW:
                 kwargs["history"] = history
                 kwargs["llm"] = llm
-                return asyncio.run(self.llama_workflow.run(**kwargs))
+                result = asyncio.run(self.llama_workflow.run(**kwargs))
             elif mode == AGENT_MODE_OPENAI:
                 kwargs["run"] = agent_run  # callable
                 kwargs["agent_kwargs"] = agent_kwargs  # as dict
-                kwargs["stream"] = is_stream # from global
-                return asyncio.run(self.openai_workflow.run(**kwargs))
+                kwargs["stream"] = is_stream  # from global
+                result = asyncio.run(self.openai_workflow.run(**kwargs))
+
+            # --- SECURITY: Guardian output check ---
+            output_text = ctx.output or ""
+            if output_text:
+                is_out_safe, out_reason = security.check_output(output_text, prompt)
+                if not is_out_safe:
+                    ctx.output = security.guardian.sanitize(output_text)
+                    output_text = ctx.output  # use sanitized text for visualization/logs
+                    security.monitor("OUTPUT_SANITIZED", {
+                        "agent_id": agent_id,
+                        "reason": out_reason,
+                    })
+
+            # --- VISUALIZATION + LASUCHS: agent stop ---
+            visualization.on_message(agent_id, "assistant", output_text[:2000])
+            visualization.on_agent_stop(agent_id, viz_session)
+            security.lasuchs.end_run(agent_id, success=bool(result))
+            security.monitor("AGENT_STOP", {"agent_id": agent_id, "success": bool(result)})
+
+            return result
 
         except Exception as e:
             self.window.core.debug.log(e)
             self.last_error = e
+            visualization.on_error(agent_id, str(e))
+            visualization.on_agent_stop(agent_id, viz_session)
+            security.lasuchs.end_run(agent_id, success=False)
+            security.monitor("AGENT_ERROR", {"agent_id": agent_id, "error": str(e)})
             return False
 
     def call_once(
@@ -319,6 +388,123 @@ class Runner:
         except Exception as e:
             self.window.core.debug.log(e)
             self.last_error = e
+
+    # ------------------------------------------------------------------
+    # Tool monitoring helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_sync_wrapper(original_fn, tname, agent_id, security, visualization):
+        """
+        Build a synchronous monitoring wrapper around a tool callable.
+        Supports both positional (*args) and keyword (**kwargs) invocations.
+        Sanitizes tool output to prevent secrets reaching streaming UI (Blocker 4).
+        Logs failures so Lasuchs audit is complete even on errors (Blocker 3).
+        """
+        def _monitored(*args, **kwargs):
+            security.lasuchs.record(EVENT_TOOL_CALL, {
+                "agent_id": agent_id,
+                "tool": tname,
+                "params_preview": str(kwargs or args)[:200],
+            })
+            visualization.on_tool_start(agent_id, tname, dict(kwargs))
+            try:
+                result = original_fn(*args, **kwargs)
+                # Sanitize tool output at call site — blocks secrets reaching
+                # streaming UI before final Guardian check (Blocker 4).
+                result_str = str(result)
+                is_safe, _ = security.check_output(result_str)
+                if not is_safe:
+                    result_str = security.guardian.sanitize(result_str)
+                    result = result_str
+                security.lasuchs.record(EVENT_TOOL_RESULT, {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                })
+                visualization.on_tool_result(agent_id, tname, result_str[:500])
+                return result
+            except Exception as exc:
+                security.lasuchs.record("tool_error", {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                    "error": str(exc)[:300],
+                })
+                raise
+
+        _monitored.__name__ = getattr(original_fn, "__name__", tname)
+        _monitored.__doc__ = getattr(original_fn, "__doc__", "")
+        return _monitored
+
+    @staticmethod
+    def _make_async_wrapper(original_fn, tname, agent_id, security, visualization):
+        """Async variant for OpenAI FunctionTool.on_invoke_tool callbacks."""
+        async def _monitored_async(run_ctx, args_str):
+            security.lasuchs.record(EVENT_TOOL_CALL, {
+                "agent_id": agent_id,
+                "tool": tname,
+                "params_preview": str(args_str)[:200],
+            })
+            visualization.on_tool_start(agent_id, tname, {"args": args_str[:200]})
+            try:
+                result = await original_fn(run_ctx, args_str)
+                result_str = str(result)
+                is_safe, _ = security.check_output(result_str)
+                if not is_safe:
+                    result_str = security.guardian.sanitize(result_str)
+                    result = result_str
+                security.lasuchs.record(EVENT_TOOL_RESULT, {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                })
+                visualization.on_tool_result(agent_id, tname, result_str[:500])
+                return result
+            except Exception as exc:
+                security.lasuchs.record("tool_error", {
+                    "agent_id": agent_id,
+                    "tool": tname,
+                    "error": str(exc)[:300],
+                })
+                raise
+
+        return _monitored_async
+
+    def _wrap_tools_for_monitoring(self, tools, agent_id, security, visualization):
+        """Instrument LlamaIndex BaseTool list (wraps tool._fn in-place)."""
+        wrapped = []
+        for tool in tools:
+            fn = getattr(tool, "_fn", None)
+            if fn is None:
+                wrapped.append(tool)
+                continue
+            tname = getattr(getattr(tool, "metadata", None), "name", "unknown")
+            tool._fn = self._make_sync_wrapper(fn, tname, agent_id, security, visualization)
+            wrapped.append(tool)
+        return wrapped
+
+    def _wrap_plugin_tools_for_monitoring(self, plugin_tools, agent_id, security, visualization):
+        """Instrument plugin_tools dict (str -> callable)."""
+        if not isinstance(plugin_tools, dict):
+            return plugin_tools
+        wrapped = {}
+        for tname, fn in plugin_tools.items():
+            if callable(fn):
+                wrapped[tname] = self._make_sync_wrapper(fn, tname, agent_id, security, visualization)
+            else:
+                wrapped[tname] = fn
+        return wrapped
+
+    def _wrap_function_tools_for_monitoring(self, function_tools, agent_id, security, visualization):
+        """Instrument OpenAI FunctionTool list (wraps on_invoke_tool in-place)."""
+        wrapped = []
+        for tool in function_tools:
+            fn = getattr(tool, "on_invoke_tool", None)
+            if fn is None:
+                wrapped.append(tool)
+                continue
+            tname = getattr(tool, "name", "unknown")
+            tool.on_invoke_tool = self._make_async_wrapper(fn, tname, agent_id, security, visualization)
+            wrapped.append(tool)
+        return wrapped
 
     def is_verbose(self) -> bool:
         """
